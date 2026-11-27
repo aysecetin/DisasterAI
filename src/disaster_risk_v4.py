@@ -22,6 +22,28 @@ from dotenv import load_dotenv
 
 load_dotenv() # .env dosyasından GOOGLE_API_KEY yüklenecek
 
+# --- GERÇEK CBS MOTORU ---
+# Eski simulate_spatial_risk() sahte veri üretiyordu; artık tüm faktörler
+# data/ altındaki gerçek .gdb katmanlarından hesaplanıyor.
+try:
+    from . import gis_engine as ge          # paket olarak import edilirse
+except ImportError:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import gis_engine as ge
+try:
+    from . import risk_communication as rc
+except ImportError:
+    import risk_communication as rc
+try:
+    from . import reclass_tables as rt
+except ImportError:
+    import reclass_tables as rt
+try:
+    from . import deney as dny
+except ImportError:
+    import deney as dny
+
 # --- API İÇİN GEREKLİ EKLENTİLER ---
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -91,9 +113,40 @@ SYSTEM_MESSAGE = (
     "'Bu sistem yalnızca afet risk analizi için tasarlanmıştır.' de ve dur."
 )
 
+# BDM sağlayıcı seçimi (İP2):
+#   MODEL_SAGLAYICI=gemini  -> Gemini 2.5 Flash API (varsayılan)
+#   MODEL_SAGLAYICI=yerel   -> Yerelde çalışan kendi ince ayarlı modelimiz
+#                              (Ollama/vLLM; OpenAI-uyumlu uç)
+# Yerel mod, projenin çevrimdışı çalışabilirlik iddiasının kanıtıdır:
+# internet ve üçüncü taraf servis olmadan da aynı beş metin türü üretilir.
+MODEL_SAGLAYICI = os.environ.get("MODEL_SAGLAYICI", "gemini").strip().lower()
+YEREL_URL = os.environ.get("YEREL_LLM_URL", "http://127.0.0.1:11434/v1")
+YEREL_MODEL = os.environ.get("YEREL_LLM_MODEL", "disasterai")
+
+
 def initialize_memory():
     global llm, memory_initialized
     if memory_initialized:
+        return
+
+    if MODEL_SAGLAYICI == "yerel":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError:
+            print("❌ HATA: yerel mod için langchain-openai gerekli "
+                  "(pip install langchain-openai).")
+            memory_initialized = True
+            return
+        print(f"🤖 Sistem Başlatılıyor: YEREL model ({YEREL_MODEL} @ {YEREL_URL})")
+        llm = ChatOpenAI(
+            model=YEREL_MODEL,
+            temperature=0.4,
+            base_url=YEREL_URL,
+            api_key="yerel",          # Ollama anahtar istemez, dolgu değer
+            timeout=180,
+        )
+        memory_initialized = True
+        print("✅ Yerel model hazır!")
         return
 
     print("🤖 Sistem Başlatılıyor: Google Gemini AI")
@@ -113,17 +166,33 @@ def initialize_memory():
 
 
 # --- AYARLAR VE GLOBAL SABİTLER ---
+# DİKKAT: Katmanların gerçek CRS'i EPSG:23035 (ED50 / UTM zone 35N).
+# Eski kodda EPSG:32635 (WGS84 / UTM 35N) varsayılıyordu — Türkiye'de iki
+# datum arasında ~90-100 m yatay fark var, 30 m pikselde ~3 piksel kayma.
+ANALYSIS_CRS = ge.TARGET_CRS
 BASE_DIR = _resolve_seferihisar_data_dir()
 LAYER_NAMES = {
     "Akarsu": "Akarsu", "Arazi_Kullanım": "Arazi_Kullanım", "Eğim": "Eğim_Raster_Data", 
     "Fay_Hattı": "Fay_Hattı", "Litoloji": "Formasyon", "Sınır": "Seferihisar_Sınır"
 }
 
-WEIGHTS = {
-    "DEPREM": {"Fay_Hattı_Uzaklığı": 0.50, "Litoloji": 0.30, "Eğim": 0.05, "Akarsu_Uzaklığı": 0.05, "Arazi_Kullanımı": 0.10}, 
-    "HEYELAN": {"Fay_Hattı_Uzaklığı": 0.15, "Litoloji": 0.35, "Eğim": 0.40, "Akarsu_Uzaklığı": 0.05, "Arazi_Kullanımı": 0.05},
-    "SEL": {"Fay_Hattı_Uzaklığı": 0.05, "Litoloji": 0.15, "Eğim": 0.10, "Akarsu_Uzaklığı": 0.60, "Arazi_Kullanımı": 0.10}
-}
+# --- AĞIRLIK SETİ ---
+# Bir TEZ KARARI. İki set var (ikisi de reclass_tables.py'de tanımlı):
+#
+#   "literatur" (VARSAYILAN) — yayımlanmış Türkiye AHP çalışmalarının bildirdiği
+#       aralıkların ortasına oturur. Deprem için litoloji/zemin en ağır faktör
+#       (0.24-0.37), fay mesafesi orta (0.07-0.15), eğim en hafif (0.04-0.06).
+#       Kaynaklar: Ocak & Bahadır (2022) CR 0.08; Demir & Altaş (2024) CR 0.023;
+#       Berber & Ceryan (2023) CR 0.054; Öz (2025) CR 0.080; Yurteri (2024) CR 0.058.
+#
+#   "mevcut" — projenin ilk sürümündeki ağırlıklar (deprem: fay 0.50, litoloji 0.30).
+#       Fay ağırlığı literatür aralığının belirgin şekilde dışındaydı.
+#       Duyarlılık analizi için korundu.
+#
+# Set değiştirmek için:  AGIRLIK_SETI=mevcut python -m uvicorn backend.main:app ...
+# Karşılaştırma için  :  python tools/agirlik_karsilastir.py
+AGIRLIK_SETI = os.environ.get("AGIRLIK_SETI", "literatur").strip().lower()
+WEIGHTS = rt.AGIRLIKLAR_MEVCUT if AGIRLIK_SETI == "mevcut" else rt.AGIRLIKLAR_LITERATUR
 
 # --- API VERİ MODELİ ---
 class AnalizSorgu(BaseModel):
@@ -137,6 +206,18 @@ class AnalizSorgu(BaseModel):
     malzeme_secim: int
     asansor_var: int
     afet_tipi: str 
+
+
+class AciklamaSorgu(AnalizSorgu):
+    """/api/aciklama için: analiz parametreleri + iletişim tonu.
+
+    ton: teknik_rapor (kontrol) | ham (ablasyon) | bilgilendirici |
+         eyleme_yonelik | yatistirici
+    """
+    ton: str = "bilgilendirici"
+    soru: str | None = None
+    endise_duzeyi: str = "orta"
+    katilimci_kodu: str | None = None   # A/B testinde anonim katılımcı kimliği
 
 
 class RotaSorgu(BaseModel):
@@ -153,54 +234,42 @@ def get_full_gdb_path(gdb_name):
     return str(BASE_DIR / gdb_name)
 
 def get_base_raster_info():
-    bounds = [481000, 4210000, 497000, 4229000] # Default UTM bounds (Seferihisar area approx)
-    pixel_size = 30
-    try:
-        boundary_gdb_path = get_full_gdb_path("Akarsu Analizi.gdb")
-        boundary_gpd = cached_gpd_read(boundary_gdb_path, layer=LAYER_NAMES["Sınır"])
-        bounds = boundary_gpd.total_bounds
-    except Exception: pass 
-    width = int(np.ceil((bounds[2] - bounds[0]) / pixel_size))
-    height = int(np.ceil((bounds[3] - bounds[1]) / pixel_size))
-    transform = Affine(pixel_size, 0, bounds[0], 0, -pixel_size, bounds[3])
-    return width, height, transform, bounds
+    """Analiz gridi — ilçe sınırından, gis_engine üzerinden üretilir."""
+    width, height, transform, bounds = ge.grid_info()
+    return width, height, transform, list(bounds)
+
 
 def simulate_spatial_risk(width, height, factor_key):
-    np.random.seed(sum(ord(c) for c in factor_key) % 100 + 1)
-    risk_base = np.random.uniform(1.0, 5.0, size=(height, width))
-    block_size = 50 
-    block_scores = np.random.uniform(1, 5, size=(height // block_size + 1, width // block_size + 1))
-    risk_matrix = np.kron(block_scores, np.ones((block_size, block_size)))[:height, :width]
-    if "DEPREM" in factor_key or "Fay" in factor_key:
-        gradient = np.linspace(5.0, 1.0, width)[None, :] 
-    elif "SEL" in factor_key or "Akarsu" in factor_key:
-        gradient = np.linspace(1.0, 5.0, height)[:, None] 
-    elif "HEYELAN" in factor_key or "Eğim" in factor_key:
-        grad_x = np.linspace(1.0, 5.0, width)[None, :]
-        grad_y = np.linspace(1.0, 5.0, height)[:, None]
-        gradient = (grad_x + grad_y) / 2
-    else:
-        gradient = np.full((height, width), 2.5)
-    gradient = np.interp(gradient, (gradient.min(), gradient.max()), (1.0, 5.0))
-    risk_matrix = (risk_base * 0.1) + (gradient * 0.9) 
-    return np.clip(risk_matrix, 1.0, 5.0)
+    """KALDIRILDI.
+
+    Bu fonksiyon katman adından türetilen bir seed ile rastgele sayı + doğrusal
+    gradyan üretiyordu; yani CBS katmanları hiç okunmuyordu. Gerçek analiz artık
+    gis_engine.py içinde. Yanlışlıkla çağrılırsa sessizce sahte veri dönmesin diye
+    hata veriyor.
+    """
+    raise RuntimeError(
+        "simulate_spatial_risk() artık kullanılmıyor. Gerçek CBS analizi için "
+        "gis_engine.weighted_overlay() kullanılmalıdır."
+    )
+
 
 def process_factor(gdb_name, layer_name, factor_type, width, height, transform):
-    key_for_sim = layer_name if layer_name else gdb_name 
-    return simulate_spatial_risk(width, height, key_for_sim)
+    """Geriye dönük uyumluluk sarmalayıcısı — gerçek katmandan üretir."""
+    raise RuntimeError(
+        "process_factor() artık kullanılmıyor; gis_engine faktör üreticilerine bakın."
+    )
 
-def perform_weighted_overlay(weights, width, height, transform):
-    total_risk_matrix = np.zeros((height, width), dtype=np.float32)
-    gdb_mapping = {"Eğim": "Eğim Analizi.gdb", "Litoloji": "Litoloji Analizi.gdb", "Akarsu_Uzaklığı": "Akarsu Analizi.gdb", "Fay_Hattı_Uzaklığı": "Fay Hattı Analizi.gdb", "Arazi_Kullanımı": "Arazi Kullanım Analizi.gdb"}
-    for factor_key, weight in weights.items():
-        if weight == 0: continue
-        gdb_name = gdb_mapping.get(factor_key)
-        base_key = factor_key.replace('_Uzaklığı', '')
-        layer_name = LAYER_NAMES.get(base_key) 
-        factor_type = 'Raster' if 'Eğim' in factor_key else 'Vector'
-        risk_scores_1_to_5 = process_factor(gdb_name, layer_name, factor_type, width, height, transform)
-        total_risk_matrix += risk_scores_1_to_5 * weight
-    return total_risk_matrix
+
+def perform_weighted_overlay(weights, width=None, height=None, transform=None, map_type="DEPREM"):
+    """
+    Gerçek CBS katmanlarından ağırlıklı çakıştırma.
+
+    Dönüş: (risk_matrisi, meta)
+      meta: hangi katmanın hangi kaynaktan geldiği, eksik katmanlar,
+            ağırlıkların yeniden normalize edilip edilmediği.
+    """
+    return ge.weighted_overlay(weights, map_type)
+
 
 def calculate_vulnerability_score(user_data):
     score = 1.0
@@ -228,18 +297,107 @@ def calculate_vulnerability_score(user_data):
     return np.clip(score, 1.0, 5.0)
 
 def finalize_and_advise(risk_matrix, transform, map_type, user_data):
-    regional_hazard_score = np.interp(risk_matrix[int(risk_matrix.shape[0]*0.5), int(risk_matrix.shape[1]*0.5)], 
-                                     (risk_matrix.min(), risk_matrix.max()), (1.0, 5.0))
-    vulnerability_score = calculate_vulnerability_score(user_data)
-    if map_type == "DEPREM": final_risk = (regional_hazard_score * 0.60) + (vulnerability_score * 0.40)
-    else: final_risk = (regional_hazard_score * 0.80) + (vulnerability_score * 0.20)
-    final_risk = np.clip(final_risk, 1.0, 5.0)
-    if final_risk >= 4.0: tavsiye = f"🔴 YÜKSEK RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
-    elif final_risk >= 3.0: tavsiye = f"🟠 ORTA RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
-    else: tavsiye = f"🟢 DÜŞÜK RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
-    return tavsiye, float(regional_hazard_score), float(vulnerability_score), float(final_risk)
+    """
+    Bölgesel tehlike skorunu KULLANICININ SEÇTİĞİ NOKTADAN örnekler.
 
-def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OUTPUT_DIR, user_coords=None):
+    Eski davranış: risk_matrix[H*0.5, W*0.5] — yani matrisin ortası. Kullanıcı
+    haritada nereye tıklarsa tıklasın bölgesel skor aynı çıkıyordu ve toplam
+    skor yalnızca bina girdilerine göre değişiyordu. Konuma özgü risk iddiası
+    bu yüzden fiilen karşılanmıyordu.
+    """
+    x, y = user_data.get("x"), user_data.get("y")
+    regional_hazard_score = None
+    if x is not None and y is not None:
+        regional_hazard_score = ge.sample_at(risk_matrix, float(x), float(y))
+    if regional_hazard_score is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Seçilen nokta Seferihisar çalışma alanının dışında. "
+                   "Lütfen ilçe sınırları içinden bir konum seçin."
+        )
+
+    vulnerability_score = calculate_vulnerability_score(user_data)
+    if map_type == "DEPREM":
+        final_risk = (regional_hazard_score * 0.60) + (vulnerability_score * 0.40)
+    else:
+        final_risk = (regional_hazard_score * 0.80) + (vulnerability_score * 0.20)
+    final_risk = float(np.clip(final_risk, 1.0, 5.0))
+
+    if final_risk >= 4.0:
+        tavsiye = f"🔴 YÜKSEK RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
+    elif final_risk >= 3.0:
+        tavsiye = f"🟠 ORTA RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
+    else:
+        tavsiye = f"🟢 DÜŞÜK RİSK BÖLGESİ ({final_risk:.2f}/5.0)"
+    return tavsiye, float(regional_hazard_score), float(vulnerability_score), final_risk
+
+
+def _harita_aciklamasi_ekle(ax, renkler, sinirlar, konum_var):
+    """Haritaya lejant, ölçek çubuğu ve kuzey oku ekler.
+
+    Bu haritalar sonuç raporuna Şekil 1–3 olarak giriyor. Lejantsız bir risk
+    haritası uzman olmayan okuyucu için yorumlanamaz: turuncunun "orta" mı
+    "yüksek" mi olduğu, macenta çizgilerin ne olduğu görünmez. Renk sınırları
+    da rapordaki risk sınıflarıyla (Düşük <3,0 · Orta 3,0–4,0 · Yüksek ≥4,0)
+    hizalıdır; böylece metindeki "%71,1'i orta" gibi oranlar haritadan
+    gözle doğrulanabilir.
+    """
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    SINIF_ADI = ("Çok düşük", "Düşük", "Orta", "Yüksek", "Çok yüksek")
+
+    def tr(sayi):
+        return f"{sayi:.1f}".replace(".", ",")
+
+    ogeler = [
+        Patch(facecolor=renk, edgecolor="black", linewidth=0.4,
+              label=f"{SINIF_ADI[i]}  ({tr(sinirlar[i])}–{tr(sinirlar[i + 1])})")
+        for i, renk in enumerate(renkler)
+    ]
+    ogeler.append(Line2D([0], [0], color="blue", linewidth=1.5, label="Akarsu"))
+    ogeler.append(Line2D([0], [0], color="#FF00FF", linewidth=1.2, linestyle="--",
+                         label="Fay hattı"))
+    ogeler.append(Line2D([0], [0], color="black", linewidth=1.5, label="İlçe sınırı"))
+    if konum_var:
+        ogeler.append(Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="cyan",
+                             markeredgecolor="black", markersize=9, label="Seçilen konum"))
+
+    lejant = ax.legend(handles=ogeler, loc="lower left", fontsize=8, framealpha=0.93,
+                       title="Risk skoru (1–5)", title_fontsize=9, borderpad=0.6,
+                       labelspacing=0.45)
+    lejant.set_zorder(40)
+
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    genislik, yukseklik = x1 - x0, y1 - y0
+
+    # Ölçek çubuğu — sağ altta, harita genişliğine göre yuvarlak bir uzunluk
+    uzunluk = 5000 if genislik > 14000 else 2000
+    bx = x1 - 0.05 * genislik - uzunluk
+    by = y0 + 0.030 * yukseklik
+    ax.plot([bx, bx + uzunluk], [by, by], color="black", linewidth=4,
+            solid_capstyle="butt", zorder=40)
+    ax.text(bx + uzunluk / 2, by + 0.010 * yukseklik, f"{uzunluk // 1000} km",
+            ha="center", va="bottom", fontsize=9, fontweight="bold", zorder=41,
+            bbox=dict(boxstyle="square,pad=0.15", facecolor="white",
+                      edgecolor="none", alpha=0.85))
+
+    # Kuzey oku — sağ üstte
+    nx = x0 + 0.94 * genislik
+    ny = y1 - 0.10 * yukseklik
+    ax.annotate("K", xy=(nx, ny), xytext=(nx, ny - 0.055 * yukseklik),
+                arrowprops=dict(facecolor="black", edgecolor="black", width=2.5,
+                                headwidth=9, headlength=8),
+                ha="center", va="center", fontsize=11, fontweight="bold", zorder=41)
+
+    ax.set_xlabel("Doğu (m) — EPSG:23035", fontsize=9)
+    ax.set_ylabel("Kuzey (m) — EPSG:23035", fontsize=9)
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.tick_params(labelsize=8)
+
+
+def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OUTPUT_DIR, user_coords=None, dpi=96):
     title = f"{map_type.upper()} RİSK HARİTASI (Seferihisar Bölgesi)"
     img_filename = f"{map_type.lower()}_risk_haritasi.png"
     output_dir = Path(output_dir)
@@ -249,10 +407,13 @@ def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OU
     overlay_filename = f"{map_type.lower()}_overlay.png"
     overlay_filepath = output_dir / overlay_filename
     
-    colors = ['#00FF00', '#FFFF00', '#FFA500', '#FF4500', '#FF0000'] 
+    colors = ['#00FF00', '#FFFF00', '#FFA500', '#FF4500', '#FF0000']
     cmap = ListedColormap(colors)
-    vmin, vmax = 1.0, 5.0
-    bounds_norm = np.linspace(vmin, vmax, 6)
+    # Renk sınırları rapordaki üç risk sınıfıyla hizalı: 3,0 ve 4,0 eşikleri
+    # renk değiştirdiği için "hücrelerin %71,1'i orta" gibi oranlar haritadan
+    # gözle doğrulanabiliyor. (Eskiden eşit aralıklıydı — 1,8 / 2,6 / 3,4 —
+    # ve hiçbir renk sınırı rapordaki sınıf sınırına denk gelmiyordu.)
+    bounds_norm = np.array([1.0, 2.0, 3.0, 4.0, 4.5, 5.0])
     norm = BoundaryNorm(bounds_norm, cmap.N)
 
     minx, miny, maxx, maxy = bounds[0], bounds[1], bounds[2], bounds[3]
@@ -264,25 +425,27 @@ def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OU
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
 
     try:
-        boundary_gdb_path = get_full_gdb_path("Akarsu Analizi.gdb")
-        boundary_gpd = cached_gpd_read(boundary_gdb_path, layer=LAYER_NAMES["Sınır"])
+        boundary_gpd = ge._read_layer("akarsu", "sinir")
         minx, miny, maxx, maxy = boundary_gpd.total_bounds
         geometries = [mapping(geom) for geom in boundary_gpd.geometry]
 
         memfile = rasterio.io.MemoryFile().open(
             driver='GTiff', height=risk_matrix.shape[0], width=risk_matrix.shape[1],
-            count=1, dtype=risk_matrix.dtype, crs='EPSG:32635', transform=transform
+            count=1, dtype=risk_matrix.dtype, crs=ANALYSIS_CRS, transform=transform
         )
         memfile.write(risk_matrix.astype(risk_matrix.dtype), 1)
         out_image, out_transform = mask(memfile, geometries, crop=False, filled=False, nodata=np.nan)
         
         show(out_image, transform=out_transform, ax=ax, cmap=cmap, norm=norm, alpha=1.0, zorder=5) 
 
-        akarsu_gpd = cached_gpd_read(get_full_gdb_path("Akarsu Analizi.gdb"), layer=LAYER_NAMES["Akarsu"])
+        # NOT: gis_engine._read_layer katmanları ANALYSIS_CRS'e dönüştürür.
+        # Fay katmanı kaynakta EPSG:4022 (derece) olduğu için doğrudan
+        # çizildiğinde harita dışına düşüyordu — bu yüzden buradan okunuyor.
+        akarsu_gpd = ge._read_layer("akarsu", "akarsu")
         akarsu_gpd.plot(ax=ax, color='blue', linewidth=1.5, zorder=12)
-        
-        fay_gpd = cached_gpd_read(get_full_gdb_path("Fay Hattı Analizi.gdb"), layer=LAYER_NAMES["Fay_Hattı"])
-        fay_gpd.plot(ax=ax, color='#FF00FF', linewidth=2.5, linestyle='--', zorder=12)
+
+        fay_gpd = ge._read_layer("fay", "fay")
+        fay_gpd.plot(ax=ax, color='#FF00FF', linewidth=1.2, linestyle='--', zorder=12)
 
         boundary_gpd.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1.5, zorder=15)
     except Exception as e:
@@ -294,8 +457,12 @@ def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OU
     ax.set_title(title, fontsize=16, fontweight='bold')
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
-    
-    plt.savefig(output_filename, dpi=96, bbox_inches='tight')  # 300→96 dpi: çok daha hızlı kayıt
+    _harita_aciklamasi_ekle(ax, colors, bounds_norm, user_coords is not None)
+
+
+    # Uygulama 96 dpi kullanır (hız); rapor şekilleri için dpi=200 ile çağrılır,
+    # yoksa lejant yazısı baskıda okunmuyor.
+    plt.savefig(output_filename, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
     
     # 2. AYRICA FOLIUM İÇİN TRANSPARAN OVERLAY OLUŞTUR
@@ -318,7 +485,9 @@ def create_risk_map_plot(risk_matrix, transform, map_type, bounds, output_dir=OU
         # Overlay'i 400px'e küçülterek kaydet — base64 çok daha küçük olur
         rgba_uint8 = (rgba_img * 255).astype(np.uint8)
         pil_img = Image.fromarray(rgba_uint8, 'RGBA')
-        pil_img = pil_img.resize((400, 400), Image.LANCZOS)
+        _h, _w = rgba_uint8.shape[0], rgba_uint8.shape[1]
+        _scale = 600.0 / max(_h, _w)
+        pil_img = pil_img.resize((max(1, int(_w * _scale)), max(1, int(_h * _scale))), Image.LANCZOS)
         pil_img.save(overlay_filepath, format='PNG', optimize=True)
     except Exception as e:
         # Eğer out_image yoksa risk_matrix'i kullan
@@ -337,14 +506,14 @@ def _resolve_analysis_coordinates(sorgu: AnalizSorgu):
     if sorgu.x is not None and sorgu.y is not None:
         return float(sorgu.x), float(sorgu.y)
     if sorgu.lat is not None and sorgu.lon is not None:
-        transformer = pyproj.Transformer.from_crs("epsg:4326", "epsg:32635", always_xy=True)
+        transformer = pyproj.Transformer.from_crs("epsg:4326", ANALYSIS_CRS, always_xy=True)
         x, y = transformer.transform(float(sorgu.lon), float(sorgu.lat))
         return float(x), float(y)
     raise HTTPException(status_code=422, detail="Analiz için x/y veya lat/lon koordinatı gerekli.")
 
 
 def _bounds_to_wgs84(bounds):
-    transformer = pyproj.Transformer.from_crs("epsg:32635", "epsg:4326", always_xy=True)
+    transformer = pyproj.Transformer.from_crs(ANALYSIS_CRS, "epsg:4326", always_xy=True)
     lon_min, lat_min = transformer.transform(float(bounds[0]), float(bounds[1]))
     lon_max, lat_max = transformer.transform(float(bounds[2]), float(bounds[3]))
     return [[lat_min, lon_min], [lat_max, lon_max]]
@@ -671,22 +840,28 @@ async def api_analiz(sorgu: AnalizSorgu, request: Request):
     width, height, transform, bounds = get_base_raster_info()
     map_type = sorgu.afet_tipi.upper()
     weights = WEIGHTS.get(map_type, WEIGHTS["DEPREM"])
-    final_risk_map = perform_weighted_overlay(weights, width, height, transform)
+
+    # Gerçek CBS katmanlarından ağırlıklı çakıştırma
+    final_risk_map, katman_meta = perform_weighted_overlay(weights, map_type=map_type)
 
     user_data = sorgu.model_dump()
     user_data["x"] = x
     user_data["y"] = y
-    
+
     tavsiye, regional_hazard, vulnerability, final_skor = finalize_and_advise(
         final_risk_map, transform, map_type, user_data
     )
-    
+
     img_name, overlay_name = create_risk_map_plot(
         final_risk_map, transform, map_type, bounds, user_coords=(x, y)
     )
     map_url = str(request.url_for("get_image", file_name=img_name))
     overlay_url = str(request.url_for("get_image", file_name=overlay_name))
-    
+
+    # "Skor Neden Böyle?" ve LLM için yapılandırılmış mekânsal olgular
+    faktor_dokumu = ge.factor_breakdown(x, y, weights, map_type)
+    mekansal_olgular = ge.mesafe_bilgisi(x, y)
+
     return {
         "tavsiye": str(tavsiye),
         "risk_score": float(final_skor),
@@ -695,14 +870,352 @@ async def api_analiz(sorgu: AnalizSorgu, request: Request):
         "map_url": map_url,
         "overlay_url": overlay_url,
         "overlay_bounds_wgs84": _bounds_to_wgs84(bounds),
-        "bounds_utm": [float(value) for value in bounds],
+        "bounds_utm": [float(v) for v in bounds],
         "coordinates": {"x": x, "y": y, "lat": sorgu.lat, "lon": sorgu.lon},
+        # --- YENİ: şeffaflık ve doğrulanabilirlik alanları ---
+        "faktor_dokumu": faktor_dokumu,
+        "mekansal_olgular": mekansal_olgular,
+        "katman_meta": katman_meta,
+        "veri_kaynagi": "gercek_cbs",
+        "analiz_crs": ANALYSIS_CRS,
+        "agirlik_seti": AGIRLIK_SETI,
     }
+
+def _analiz_hesapla(sorgu: AnalizSorgu):
+    """api_analiz ve api_aciklama'nın ortak hesap çekirdeği."""
+    x, y = _resolve_analysis_coordinates(sorgu)
+    map_type = sorgu.afet_tipi.upper()
+    weights = WEIGHTS.get(map_type, WEIGHTS["DEPREM"])
+    risk_map, katman_meta = perform_weighted_overlay(weights, map_type=map_type)
+
+    user_data = sorgu.model_dump()
+    user_data["x"], user_data["y"] = x, y
+    tavsiye, hazard, vuln, skor = finalize_and_advise(risk_map, None, map_type, user_data)
+
+    return {
+        "afet_tipi": map_type,
+        "tavsiye": tavsiye,
+        "risk_score": float(skor),
+        "hazard_score": float(hazard),
+        "vulnerability_score": float(vuln),
+        "faktor_dokumu": ge.factor_breakdown(x, y, weights, map_type),
+        "mekansal_olgular": ge.mesafe_bilgisi(x, y),
+        "katman_meta": katman_meta,
+        "coordinates": {"x": x, "y": y, "lat": sorgu.lat, "lon": sorgu.lon},
+        "yapim_yili": sorgu.yapim_yili,
+        "malzeme_secim": sorgu.malzeme_secim,
+        "bina_kat_sayisi": sorgu.bina_kat_sayisi,
+        "oturulan_kat": sorgu.oturulan_kat,
+    }
+
+
+@app.post("/api/aciklama")
+async def api_aciklama(sorgu: AciklamaSorgu):
+    """
+    Cog-S&C iletişim modülü: CBS çıktısını seçilen tonda doğal dile çevirir.
+
+    Bu uç nokta, araştırma önerisindeki H2 hipotezinin test edilebilmesi için
+    eklendi. Aynı mekânsal veriden, yalnızca `ton` parametresi değiştirilerek
+    farklı iletişim çıktıları üretilir. `ton="teknik_rapor"` A/B testinin
+    kontrol kolunu (LLM kullanmayan, deterministik geleneksel rapor),
+    `ton="ham"` ise ablasyon kolunu (ton yönergesi olmayan düz BDM çıktısı)
+    verir.
+    """
+    ton = (sorgu.ton or "bilgilendirici").strip().lower()
+
+    # ton="otomatik": tonu kullanıcının yazdığı metinden çıkar (Cog-S&C bağlam
+    # duyarlılığı). Deney akışı bunu KULLANMAZ — orada ton kola göre sabittir.
+    ton_secimi = None
+    if ton == "otomatik":
+        ton_secimi = rc.ton_sec(sorgu.soru or "", sorgu.endise_duzeyi)
+        ton = ton_secimi["ton"]
+
+    if ton not in rc.GECERLI_TONLAR:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Geçersiz ton: {ton}. Geçerli değerler: "
+                   f"{', '.join(rc.GECERLI_TONLAR)}, otomatik"
+        )
+
+    analiz = _analiz_hesapla(sorgu)
+
+    # --- KONTROL KOLU: LLM kullanılmaz ---
+    if ton == "teknik_rapor":
+        metin = rc.teknik_rapor(analiz)
+        sonuc = {
+            "ton": ton, "metin": metin, "llm_kullanildi": False,
+            "dogrulama": rc.dogrula(metin, analiz), "analiz": analiz,
+            "ton_secimi": ton_secimi,
+        }
+        rc.deney_kaydet({
+            "ton": ton, "katilimci_kodu": sorgu.katilimci_kodu,
+            "koordinat": analiz["coordinates"], "afet_tipi": analiz["afet_tipi"],
+            "risk_score": analiz["risk_score"], "metin": metin,
+            "dogrulama": sonuc["dogrulama"], "llm_kullanildi": False,
+        })
+        return sonuc
+
+    # --- BDM KOLLARI ---
+    initialize_memory()
+    if llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="BDM kullanılamıyor (GOOGLE_API_KEY eksik olabilir). "
+                   "Kontrol kolu için ton='teknik_rapor' kullanılabilir."
+        )
+
+    prompt = rc.cot_prompt(
+        analiz, ton,
+        kullanici_sorusu=sorgu.soru or "",
+        endise_duzeyi=sorgu.endise_duzeyi,
+    )
+    try:
+        metin = llm.invoke(prompt).content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BDM çağrısı başarısız: {e}")
+
+    dogrulama = rc.dogrula(metin, analiz)
+    sonuc = {
+        "ton": ton, "metin": metin, "llm_kullanildi": True,
+        "dogrulama": dogrulama, "analiz": analiz, "prompt": prompt,
+        "ton_secimi": ton_secimi,
+    }
+    rc.deney_kaydet({
+        "ton": ton, "katilimci_kodu": sorgu.katilimci_kodu,
+        "koordinat": analiz["coordinates"], "afet_tipi": analiz["afet_tipi"],
+        "risk_score": analiz["risk_score"], "metin": metin,
+        "dogrulama": dogrulama, "llm_kullanildi": True,
+        "endise_duzeyi": sorgu.endise_duzeyi, "soru": sorgu.soru,
+    })
+    return sonuc
+
+
+@app.post("/api/tonlari-karsilastir")
+async def api_tonlari_karsilastir(sorgu: AciklamaSorgu):
+    """
+    H2 için tek çağrıda dört kolu birden üretir: teknik_rapor, ham,
+    bilgilendirici, eyleme_yonelik, yatistirici.
+
+    Ton doğruluğu etiketlemesi ve deney materyali hazırlığı için kullanılır:
+    aynı mekânsal veriden üretilen çıktılar yan yana konularak
+    değerlendiricilere sunulabilir.
+    """
+    analiz = _analiz_hesapla(sorgu)
+    ciktilar = {"teknik_rapor": {
+        "metin": rc.teknik_rapor(analiz), "llm_kullanildi": False,
+    }}
+    ciktilar["teknik_rapor"]["dogrulama"] = rc.dogrula(
+        ciktilar["teknik_rapor"]["metin"], analiz)
+
+    initialize_memory()
+    for ton in ("ham", "bilgilendirici", "eyleme_yonelik", "yatistirici"):
+        if llm is None:
+            ciktilar[ton] = {"hata": "BDM kullanılamıyor (GOOGLE_API_KEY?)"}
+            continue
+        try:
+            prompt = rc.cot_prompt(analiz, ton, sorgu.soru or "", sorgu.endise_duzeyi)
+            metin = llm.invoke(prompt).content.strip()
+            ciktilar[ton] = {
+                "metin": metin, "llm_kullanildi": True,
+                "dogrulama": rc.dogrula(metin, analiz),
+            }
+        except Exception as e:
+            ciktilar[ton] = {"hata": str(e)}
+
+    rc.deney_kaydet({
+        "tip": "ton_karsilastirma", "katilimci_kodu": sorgu.katilimci_kodu,
+        "koordinat": analiz["coordinates"], "afet_tipi": analiz["afet_tipi"],
+        "risk_score": analiz["risk_score"],
+        "ciktilar": {k: v.get("metin", v.get("hata")) for k, v in ciktilar.items()},
+        "dogrulamalar": {k: v.get("dogrulama") for k, v in ciktilar.items()},
+    })
+    return {"analiz": analiz, "ciktilar": ciktilar}
+
+
+# ===========================================================================
+# DENEY UÇLARI (İP4 — kontrollü kullanıcı deneyi)
+# ===========================================================================
+
+@app.get("/api/deney/yapilandirma")
+def api_deney_yapilandirma():
+    """Arayüzün deney ekranını kurmak için gereken her şey."""
+    return {
+        "senaryolar": dny.SENARYOLAR,
+        "olcekler": dny.OLCEKLER,
+        "likert": [{"deger": d, "etiket": e} for d, e in dny.LIKERT],
+        "kollar": list(dny.KOLLAR),
+        "durum": dny.durum(),
+    }
+
+
+@app.post("/api/deney/kol-ata")
+async def api_deney_kol_ata(istek: dict):
+    """
+    Katılımcıyı dengeli biçimde bir kola atar ve kaydeder.
+
+    Aynı katılımcı kodu tekrar gönderilirse aynı kol döner (yeniden atama yok).
+    """
+    kod = (istek.get("katilimci_kodu") or "").strip()
+    endise = (istek.get("endise_duzeyi") or "orta").strip().lower()
+    if not kod:
+        raise HTTPException(status_code=422, detail="Katılımcı kodu gerekli.")
+    try:
+        atama = dny.kol_ata(kod)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if atama.get("yeni"):
+        dny.katilimci_kaydet(kod, atama["kol"], endise,
+                             istek.get("demografik"))
+    else:
+        endise = atama.get("endise_duzeyi", endise)
+
+    return {
+        "katilimci_kodu": kod,
+        "kol": atama["kol"],
+        "ton": dny.ton_sec(atama["kol"], endise),
+        "endise_duzeyi": endise,
+        "yeni_katilimci": atama.get("yeni", False),
+        "durum": dny.durum(),
+    }
+
+
+@app.post("/api/deney/senaryo-metni")
+async def api_deney_senaryo_metni(istek: dict):
+    """
+    Bir senaryo için katılımcıya gösterilecek metni üretir.
+
+    Katılımcı yalnızca kendi koluna ait metni görür (körleme).
+    """
+    kod = (istek.get("katilimci_kodu") or "").strip()
+    senaryo_kodu = (istek.get("senaryo_kodu") or "").strip()
+    if not kod:
+        raise HTTPException(status_code=422, detail="Katılımcı kodu gerekli.")
+
+    senaryo = next((s for s in dny.SENARYOLAR if s["kod"] == senaryo_kodu), None)
+    if senaryo is None:
+        raise HTTPException(status_code=404, detail=f"Senaryo bulunamadı: {senaryo_kodu}")
+
+    atama = dny.kol_ata(kod)
+    endise = atama.get("endise_duzeyi", (istek.get("endise_duzeyi") or "orta"))
+    ton = dny.ton_sec(atama["kol"], endise)
+
+    sorgu = AciklamaSorgu(
+        lat=senaryo["lat"], lon=senaryo["lon"], afet_tipi=senaryo["afet_tipi"],
+        ton=ton, endise_duzeyi=endise, katilimci_kodu=kod, **senaryo["bina"],
+    )
+    sonuc = await api_aciklama(sorgu)
+
+    return {
+        "senaryo": senaryo,
+        "kol": atama["kol"],
+        "ton": ton,
+        "metin": sonuc["metin"],
+        "dogrulama": sonuc["dogrulama"],
+        # Katılımcıya gösterilmez; uygulayıcının kontrolü için
+        "_analiz": sonuc["analiz"],
+    }
+
+
+@app.post("/api/deney/yanit")
+async def api_deney_yanit(istek: dict):
+    """Katılımcının ölçek yanıtlarını kaydeder ve puanları hesaplar."""
+    if not (istek.get("katilimci_kodu") or "").strip():
+        raise HTTPException(status_code=422, detail="Katılımcı kodu gerekli.")
+    return dny.yanit_kaydet(istek)
+
+
+@app.get("/api/deney/durum")
+def api_deney_durum():
+    return dny.durum()
+
 
 @app.get("/api/health")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "data_dir": str(BASE_DIR), "outputs_dir": str(OUTPUT_DIR)}
+    return {"status": "ok", "data_dir": str(BASE_DIR), "outputs_dir": str(OUTPUT_DIR),
+            "agirlik_seti": AGIRLIK_SETI, "analiz_crs": ANALYSIS_CRS,
+            "model_saglayici": MODEL_SAGLAYICI,
+            "model_adi": (YEREL_MODEL if MODEL_SAGLAYICI == "yerel" else "gemini-2.5-flash")}
+
+# Yöntem sayfası, sayıları elle yazmak yerine bu uçtan okur: ağırlık seti,
+# dayanak etiketi sayıları ve duyarlılık analizi tek kaynaktan gelir, böylece
+# arayüzdeki değer raporla ayrışamaz.
+FAKTOR_ADLARI = {
+    "Fay_Hattı_Uzaklığı": "Fay hattına uzaklık",
+    "Litoloji": "Zemin / litoloji",
+    "Eğim": "Eğim",
+    "Akarsu_Uzaklığı": "Akarsuya uzaklık",
+    "Arazi_Kullanımı": "Arazi kullanımı",
+}
+
+AFET_ADLARI = {"DEPREM": "Deprem", "HEYELAN": "Heyelan", "SEL": "Sel"}
+
+
+def _duyarlilik_ozeti() -> list[dict]:
+    """tools/agirlik_karsilastir.py çıktısındaki özet tablosunu okur.
+
+    Kappa'yı istek anında yeniden hesaplamak bütün rasterleri yeniden üretmek
+    demek; onun yerine üretilmiş rapor okunur. Rapor yoksa bölüm gösterilmez.
+    """
+    yol = OUTPUT_DIR / "agirlik_duyarlilik_analizi.md"
+    if not yol.exists():
+        return []
+    satirlar = []
+    ozet = False
+    for satir in yol.read_text(encoding="utf-8").splitlines():
+        if satir.startswith("## Özet"):
+            ozet = True
+            continue
+        if ozet:
+            if satir.startswith("#"):
+                break
+            hucreler = [h.strip() for h in satir.strip().strip("|").split("|")]
+            if len(hucreler) != 6 or hucreler[0] in ("Afet", "---"):
+                continue
+            try:
+                satirlar.append({
+                    "afet": hucreler[0],
+                    "ort_skor_eski": float(hucreler[1]),
+                    "ort_skor_literatur": float(hucreler[2]),
+                    "ort_mutlak_fark": float(hucreler[3]),
+                    "sinif_degisimi": hucreler[4],
+                    "kappa": float(hucreler[5]),
+                })
+            except ValueError:
+                continue
+    return satirlar
+
+
+@app.get("/api/yontem")
+def api_yontem():
+    """Yöntem sayfasının izlenebilirlik verisi (ağırlıklar, dayanaklar, duyarlılık)."""
+    sayilar = rt.etiket_sayilari()
+    toplam = sum(sayilar.values())
+    return {
+        "agirlik_seti": AGIRLIK_SETI,
+        "analiz_crs": ANALYSIS_CRS,
+        "piksel_m": ge.PIXEL_SIZE,
+        "faktor_adlari": FAKTOR_ADLARI,
+        "afet_adlari": AFET_ADLARI,
+        "agirliklar": WEIGHTS,
+        "dayanak": {
+            "sayilar": sayilar,
+            "toplam": toplam,
+            "aciklama": {
+                "K": "Kaynaklı — yayımlanmış bir çalışmadan alınmış ya da ölçeklenmiş",
+                "U": "Uyarlama — yayımlanmış şemalardan uyarlanmış, birebir alıntı değil",
+                "E": "Eksper ataması — literatürde karşılığı bulunamadı, tarafımızca atanmıştır",
+            },
+        },
+        "kaynak_sayisi": len(rt.KAYNAKLAR),
+        "duyarlilik": _duyarlilik_ozeti(),
+        "katmanlar": sorted(ge.LAYER.values()),
+        "dem": "Copernicus GLO-30 (ESA, 2024) — eğim Horn (1981) yöntemiyle üretildi",
+        "bina_agirliklari": {"DEPREM": {"bolgesel": 0.60, "bina": 0.40},
+                             "DIGER": {"bolgesel": 0.80, "bina": 0.20}},
+    }
+
 
 @app.get("/outputs/{file_name}")
 async def get_image(file_name: str):

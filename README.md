@@ -1,334 +1,133 @@
 # DisasterAI
 
-DisasterAI, İzmir Seferihisar bölgesi için CBS tabanlı afet risk analizi yapan ve sonucu kullanıcı dostu bir web arayüzünde gösteren karar destek uygulamasıdır. Kullanıcı harita üzerinden konum seçer, bina bilgilerini girer ve deprem, heyelan veya sel/taşkın için risk skorunu görüntüler.
+**GIS-based multi-hazard disaster risk analysis, explained in plain language by a fine-tuned local LLM.**
 
-Uygulama ayrıca risk katmanını harita üzerinde gösterir, skorun neden oluştuğunu açıklar, yakın açık/toplanma alanı için yürüyüş rotası üretir ve analiz sonucunu yapay zeka destekli asistan ile yorumlar.
+A resident picks a point on the map and describes their building. DisasterAI computes an earthquake, landslide or flood risk score from GIS layers, shows why the score is what it is, routes them on foot to the nearest assembly area, and lets them ask follow-up questions to an assistant. The assistant can run on Gemini or fully offline on a Turkish Llama 8B model I fine-tuned with QLoRA.
 
-## Özellikler
+Graduation project, Management Information Systems, Pamukkale University (2026). **Supported by TÜBİTAK 2209-A** (Undergraduate Research Projects Support Programme). Study area: Seferihisar, İzmir.
 
-- Deprem, heyelan ve sel/taşkın için afet risk analizi
-- CBS katmanlarına dayalı ağırlıklı çakıştırma yaklaşımı
-- Bina bilgilerine göre bina hassasiyeti skoru
-- Toplam risk skoru ve risk seviyesi gösterimi
-- Harita üzerinde risk katmanı ve şeffaflık kontrolü
-- Haritadan analiz noktası seçme ve adres/koordinat gösterimi
-- Yakın açık/toplanma alanı bulma
-- Yol ağına göre yürüyüş rotası, mesafe ve süre hesabı
-- "Skor Neden Böyle?" açıklama bölümü
-- Senaryo karşılaştırması
-- Analiz geçmişi
-- PDF raporu alma
-- Google Gemini 2.5 Flash destekli analiz asistanı
-- Açık/koyu tema
+![Analysis result: risk layer on the map, total score, factor contributions and explanation](assets/readme/02_analiz_sonucu_yerel.jpg)
 
-## Kullanılan Teknolojiler
+## How it works
 
-### Backend
+The risk score is calculated, not generated. The language model only explains a result that the GIS engine has already produced.
 
-- Python
-- FastAPI
-- GeoPandas
-- Rasterio
-- Shapely
-- PyProj
-- NumPy / Pandas
-- Matplotlib
-- Requests
-- LangChain Google GenAI
-- Google Gemini 2.5 Flash
+```
+location + building info
+        │
+        ▼
+ GIS engine (weighted overlay)          building vulnerability
+ fault distance · lithology · slope  +  material · year · floors ·
+ land use · distance to rivers          floor lived on · elevator
+        │                                       │
+        └──────────────► total risk score ◄─────┘
+                               │
+              ┌────────────────┼─────────────────┐
+              ▼                ▼                 ▼
+        "Why this score?"  walking route to   assistant (Gemini or
+        factor breakdown   assembly area      local fine-tuned model)
+```
 
-### Frontend
+**Weighted overlay with literature-based weights.** Each hazard combines reclassified GIS layers (1–5) with factor weights. The first version gave fault distance a weight of 0.50 for earthquakes; published Turkish AHP studies put it at 0.07–0.15. I replaced the weights with values in the middle of the ranges reported by five studies (consistency ratios 0.023–0.080) and measured how much the risk map changed using Cohen's kappa across the three risk classes. See [`outputs/agirlik_duyarlilik_analizi.md`](outputs/agirlik_duyarlilik_analizi.md).
 
-- React
-- Vite
-- Leaflet / React Leaflet
-- Lucide React
-- CSS
+| Earthquake factor | Weight |
+| --- | --- |
+| Lithology | 0.45 |
+| Distance to fault | 0.30 |
+| Land use | 0.12 |
+| Slope | 0.08 |
+| Distance to rivers | 0.05 |
 
-### Harita ve Rota
+## The fine-tuned model
 
-- OpenStreetMap
-- OSRM yürüyüş rotası servisi
-- CBS veri katmanları: fay hattı, eğim, litoloji, akarsu, arazi kullanımı ve sınır verileri
+| | |
+| --- | --- |
+| Base model | `ytu-ce-cosmos/Turkish-Llama-8b-Instruct-v0.1` |
+| Method | QLoRA (r=16, α=32), 1 epoch, trained on Kaggle |
+| Training data | ~2,500 examples generated from the GIS engine's own outputs |
+| Serving | Quantised to GGUF Q4_K_M and served locally with Ollama |
 
-## Proje Yapısı
+Evaluated on 40 held-out cases ([`outputs/model_degerlendirme`](outputs/model_degerlendirme)):
+
+| Metric | Result |
+| --- | --- |
+| Answers with no invented numbers | **97.5%** (39/40) |
+| Invented numbers among all numbers produced | **0.3%** (1/390) |
+| Answers that state the composite risk score | 87.5% (35/40) |
+| Outdated safety advice | 0/40 |
+| Memorisation check: 30+ word sequences copied from training data | **none** |
+
+The memorisation check compares every generated text with the 2,014 training texts using 8-word sequence overlap (mean 15.4%, which is in line with fixed domain phrasing) and with the teacher model's reference answer for the same input (mean similarity 19.4%).
+
+![The assistant answering with the local model](assets/readme/04_sohbet_1_yerel.jpg)
+
+## Tone of risk communication
+
+The same result can be told in different ways. [`src/risk_communication.py`](src/risk_communication.py) defines communication tones (for example a calming tone that does not downplay the risk) and picks one from the user's context. [`src/deney.py`](src/deney.py) and the **Experiment** tab run a three-arm, between-subjects user study: a deterministic technical report with no LLM, the raw LLM output, and the tone-managed output.
+
+## Features
+
+- Earthquake, landslide and flood/inundation risk for any point in the study area
+- Building vulnerability from material, construction year, number of floors, floor lived on and elevator
+- Risk layer on the map with adjustable opacity
+- "Why this score?" factor breakdown
+- Scenario comparison (for example, the score after retrofitting)
+- Nearest assembly area and walking route with distance and time (OSRM)
+- Analysis history, PDF report, light and dark theme
+- Assistant on Gemini 2.5 Flash or a local model, switched with one environment variable
+
+## Tech stack
+
+**Backend:** Python, FastAPI, GeoPandas, Rasterio, Shapely, PyProj, NumPy, pandas, LangChain
+**Frontend:** React, Vite, Leaflet / React Leaflet
+**ML:** Hugging Face Transformers, PEFT (QLoRA), bitsandbytes, llama.cpp (GGUF), Ollama
+**Data:** OpenStreetMap, OSRM, Copernicus DEM (slope), GIS layers for faults, lithology, rivers and land use
+
+## Project structure
 
 ```text
-disaster-risk-turkey-master/
-├── backend/
-│   └── main.py                 # FastAPI giriş noktası
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx             # Ana React uygulaması
-│   │   ├── main.jsx
-│   │   └── styles.css
-│   ├── package.json
-│   └── package-lock.json
-├── src/
-│   ├── disaster_risk_v4.py     # Ana analiz motoru ve API uçları
-├── data/
-│   └── İZMİR SEFERİHİSAR/    # CBS veri katmanları
-├── outputs/                    # Analiz sırasında üretilen harita çıktıları
-├── requirements.txt            # Python bağımlılıkları
-└── README.md
+backend/main.py              FastAPI entry point
+src/
+  disaster_risk_v4.py        analysis engine and API endpoints
+  gis_engine.py              raster/vector sampling and weighted overlay
+  reclass_tables.py          reclassification tables (1–5) per factor
+  risk_communication.py      communication tones and tone selection
+  deney.py                   user-study infrastructure
+frontend/src/                React app (App.jsx, ExperimentPanel.jsx)
+data/                        GIS layers for Seferihisar, slope raster
+tools/                       QLoRA training notebooks, evaluation and analysis scripts
+outputs/                     risk maps, weight sensitivity analysis, model evaluation
 ```
 
-## Gereksinimler
+## Run it locally
 
-- Python 3.10 veya üzeri
-- Node.js 18 veya üzeri
-- npm
-- İnternet bağlantısı
-
-İnternet bağlantısı özellikle OpenStreetMap, OSRM rota servisi ve Gemini API için gereklidir.
-
-## İlk Kurulum
-
-Projeyi yeni bir bilgisayarda ilk kez çalıştırmak için aşağıdaki adımları izle.
-
-### 1. Proje klasörüne gir
+Requirements: Python 3.10+, Node.js 18+.
 
 ```bash
-cd "path/to/DisasterAI"
-```
-
-Başka bilgisayarda klasör yolu farklıysa kendi proje klasörünün yolunu kullan.
-
-### 2. Python sanal ortamı oluştur
-
-macOS / Linux:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
-```
-
-### 3. Python paketlerini kur
-
-```bash
-pip install --upgrade pip
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+cd frontend && npm install && cd ..
 ```
 
-### 4. Frontend paketlerini kur
+Backend (terminal 1):
 
 ```bash
-cd frontend
-npm install
-cd ..
-```
-
-### 5. Gemini API anahtarı ekle
-
-Proje kök dizininde `.env` dosyası oluştur:
-
-```bash
-GOOGLE_API_KEY=buraya_api_anahtarini_yaz
-```
-
-Bu anahtar sadece analiz asistanı için gereklidir. Risk analizi, harita ve rota özellikleri Gemini olmadan da çalışabilir; ancak asistan yanıtları sınırlı olur.
-
-`.env` dosyasını GitHub'a yükleme.
-
-## Projeyi Çalıştırma
-
-Uygulamayı çalıştırmak için iki ayrı terminal aç.
-
-### Terminal 1: Backend
-
-Proje kök dizininde:
-
-```bash
-source venv/bin/activate
-MPLCONFIGDIR=/private/tmp/matplotlib-cache python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
-```
-
-Windows kullanıyorsan:
-
-```powershell
-venv\Scripts\Activate.ps1
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
 ```
 
-Backend adresi:
-
-```text
-http://127.0.0.1:8514
-```
-
-Sağlık kontrolü:
-
-```text
-http://127.0.0.1:8514/api/health
-```
-
-### Terminal 2: Frontend
+Frontend (terminal 2):
 
 ```bash
-cd frontend
-npm run dev
+cd frontend && npm run dev
 ```
 
-Web arayüzü:
+Open `http://127.0.0.1:5173`.
 
-```text
-http://127.0.0.1:5173
-```
+**Assistant provider.** By default the assistant uses Gemini: put `GOOGLE_API_KEY=...` in a `.env` file at the project root. To run it offline on the fine-tuned model, build it with Ollama (`ollama create disasterai -f tools/Modelfile.disasterai`, after pointing `FROM` at your GGUF file) and start the backend with `MODEL_SAGLAYICI=yerel`. Risk analysis, the map and routing work without any LLM.
 
-Tarayıcıda bu adresi aç:
+**Slope raster.** `data/raster/egim.tif` is included. To regenerate it, download the Copernicus DEM tiles N38 E026 and N38 E027 into `data/raster/` and run `tools/egim_uret.py`.
 
-```text
-http://127.0.0.1:5173
-```
+## Author
 
-## Bu Bilgisayarda Mevcut Ortam
-
-Bu bilgisayarda `venv` klasörü silinmiş görünüyor; ancak `ayse-env` adlı bir Python sanal ortamı mevcut. Şu an projeyi bu ortamla da çalıştırabilirsin:
-
-```bash
-MPLCONFIGDIR=/private/tmp/matplotlib-cache ayse-env/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
-```
-
-Frontend için:
-
-```bash
-cd frontend
-npm run dev
-```
-
-Yeni bilgisayarda `ayse-env` taşımak zorunda değilsin. En temiz yol, yeni bir `venv` oluşturup `requirements.txt` ile paketleri yeniden kurmaktır.
-
-## venv Silinirse Ne Olur?
-
-`venv` veya `ayse-env` silinirse proje kodları silinmez. Sadece Python paketlerinin kurulu olduğu sanal ortam silinmiş olur.
-
-Yeniden oluşturmak için:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-Sonra backend'i tekrar çalıştır:
-
-```bash
-MPLCONFIGDIR=/private/tmp/matplotlib-cache python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
-```
-
-Kısaca: `venv` silinirse korkulacak bir şey yok; `requirements.txt` dosyası durduğu sürece ortam yeniden kurulabilir.
-
-## Başka Bilgisayarda Nasıl Kullanılır?
-
-Başka bilgisayara taşırken şu dosya ve klasörler yeterlidir:
-
-- `backend/`
-- `frontend/`
-- `src/`
-- `data/İZMİR SEFERİHİSAR/`
-- `outputs/` isteğe bağlıdır; yoksa uygulama yeniden çıktı üretir
-- `requirements.txt`
-- `README.md`
-- `.env.example` veya kendi `.env` dosyan
-
-Taşımana gerek olmayan klasörler:
-
-- `venv/`
-- `ayse-env/`
-- `frontend/node_modules/`
-- `frontend/dist/`
-- `__pycache__/`
-- `.DS_Store`
-
-Bu klasörler başka bilgisayarda yeniden oluşturulabilir.
-
-Yeni bilgisayarda sırayla:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Ayrı terminalde:
-
-```bash
-source venv/bin/activate
-MPLCONFIGDIR=/private/tmp/matplotlib-cache python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
-```
-
-## Portlar
-
-Varsayılan portlar:
-
-- Frontend: `5173`
-- Backend: `8514`
-
-Frontend farklı bir backend adresine bağlanacaksa `frontend/.env` dosyasına şunu yaz:
-
-```bash
-VITE_API_BASE_URL=http://127.0.0.1:8514
-```
-
-## Sık Karşılaşılan Sorunlar
-
-### localhost:5173 açılmıyor
-
-Frontend çalışmıyordur. Şunu başlat:
-
-```bash
-cd frontend
-npm run dev
-```
-
-### Analiz çalışmıyor ama sayfa açılıyor
-
-Backend kapalı olabilir. Şunu başlat:
-
-```bash
-source venv/bin/activate
-MPLCONFIGDIR=/private/tmp/matplotlib-cache python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
-```
-
-### Gemini / Analiz Asistanı hata veriyor
-
-`.env` içinde `GOOGLE_API_KEY` eksik olabilir veya Gemini servisi yoğunluk yaşıyor olabilir. Bu durum risk analiz motorunu bozmaz; sadece asistan yanıtını etkiler.
-
-### ModuleNotFoundError hatası
-
-Sanal ortam aktif değildir veya paketler kurulmamıştır:
-
-```bash
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### npm: command not found
-
-Node.js kurulu değildir. Node.js 18 veya üzeri kurulmalıdır.
-
-## Akademik Not
-
-Risk skoru, CBS tabanlı ağırlıklı çakıştırma yaklaşımıyla hesaplanır. Bölgesel tehlike skoru; fay hattı, eğim, litoloji, akarsuya yakınlık ve arazi kullanımı gibi katmanlardan üretilir. Bina hassasiyeti ise kullanıcının girdiği yapı malzemesi, yapım yılı, kat sayısı, oturulan kat ve asansör bilgisiyle hesaplanır.
-
-Yapay zeka modeli risk skorunu hesaplamak için değil, hesaplanan sonucu doğal dilde açıklamak için kullanılır.
-
-## Geliştirici
-
-Ayşe Çetin  
-Yönetim Bilişim Sistemleri  
-Pamukkale Üniversitesi
+**Ayşe Çetin** · Management Information Systems, Pamukkale University
+[Portfolio](https://aysecetin.github.io) · [LinkedIn](https://www.linkedin.com/in/ayseecetin/)

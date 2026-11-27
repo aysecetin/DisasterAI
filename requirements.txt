@@ -21,3 +21,10 @@ fastapi>=0.110.0
 uvicorn>=0.29.0
 pypdf>=4.1.0
 requests>=2.32.0
+rasterio
+scipy>=1.11.0
+langchain-openai>=0.2.0
+# tools/ekler_pdf_uret.py (Ek 1-7 PDF uretimi) dogrudan kullaniyor;
+# ikisi de zaten kurulu, surum alt sinirlari kurulu surume gore.
+pillow>=10.0.0
+websocket-client>=0.58.0

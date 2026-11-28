@@ -6,6 +6,8 @@ A resident picks a point on the map and describes their building. DisasterAI com
 
 Graduation project, Management Information Systems, Pamukkale University (2026). **Supported by TÜBİTAK 2209-A** (Undergraduate Research Projects Support Programme). Study area: Seferihisar, İzmir.
 
+*[Türkçe açıklama aşağıda](#türkçe)*
+
 ![Analysis result: risk layer on the map, total score, factor contributions and explanation](assets/readme/02_analiz_sonucu_yerel.jpg)
 
 ## How it works
@@ -131,3 +133,109 @@ Open `http://127.0.0.1:5173`.
 
 **Ayşe Çetin** · Management Information Systems, Pamukkale University
 [Portfolio](https://aysecetin.github.io) · [LinkedIn](https://www.linkedin.com/in/ayseecetin/)
+
+---
+
+## Türkçe
+
+# DisasterAI
+
+**CBS tabanlı çoklu afet riski analizi; sonucu, ince ayar yapılmış yerel bir dil modeli sade bir dille açıklıyor.**
+
+Kullanıcı haritadan bir nokta seçer ve binasını tanımlar. DisasterAI, CBS katmanlarından deprem, heyelan veya sel riski puanını hesaplar, puanın neden o çıktığını gösterir, kişiyi yürüyerek en yakın toplanma alanına yönlendirir ve bir asistana takip soruları sormasını sağlar. Asistan Gemini ile ya da QLoRA ile ince ayar yaptığım Türkçe Llama 8B modeliyle tamamen çevrimdışı çalışabiliyor.
+
+Pamukkale Üniversitesi Yönetim Bilişim Sistemleri bitirme projesi (2026). **TÜBİTAK 2209-A** (Üniversite Öğrencileri Araştırma Projeleri Destekleme Programı) kapsamında desteklendi. Çalışma alanı: Seferihisar, İzmir.
+
+### Nasıl çalışıyor
+
+Risk puanı **hesaplanır, üretilmez.** Dil modeli yalnızca CBS motorunun zaten ürettiği sonucu açıklar.
+
+- **CBS motoru (ağırlıklı çakıştırma):** fay uzaklığı, litoloji, eğim, arazi kullanımı ve akarsuya uzaklık katmanları
+- **Bina kırılganlığı:** malzeme, yapım yılı, kat sayısı, oturulan kat, asansör
+- Bu ikisi birleşerek **toplam risk puanını** verir; ardından "Bu puan neden çıktı?" faktör dökümü, toplanma alanına yürüme rotası ve asistan devreye girer.
+
+**Literatüre dayalı ağırlıklar.** Her afet türü, 1–5 arasında yeniden sınıflandırılmış CBS katmanlarını faktör ağırlıklarıyla birleştirir. İlk sürümde depremde fay uzaklığının ağırlığı 0,50'ydi; Türkiye'de yayımlanmış AHP çalışmaları bu değeri 0,07–0,15 aralığında veriyor. Ağırlıkları beş çalışmanın raporladığı aralıkların ortasındaki değerlerle değiştirdim (tutarlılık oranları 0,023–0,080) ve risk haritasının ne kadar değiştiğini üç risk sınıfı üzerinden Cohen'in kappa katsayısıyla ölçtüm. Ayrıntılar: [`outputs/agirlik_duyarlilik_analizi.md`](outputs/agirlik_duyarlilik_analizi.md).
+
+| Deprem faktörü | Ağırlık |
+| --- | --- |
+| Litoloji | 0,45 |
+| Faya uzaklık | 0,30 |
+| Arazi kullanımı | 0,12 |
+| Eğim | 0,08 |
+| Akarsuya uzaklık | 0,05 |
+
+### İnce ayarlı model
+
+| | |
+| --- | --- |
+| Temel model | `ytu-ce-cosmos/Turkish-Llama-8b-Instruct-v0.1` |
+| Yöntem | QLoRA (r=16, α=32), 1 epoch, Kaggle'da eğitildi |
+| Eğitim verisi | CBS motorunun kendi çıktılarından üretilen ~2.500 örnek |
+| Sunum | GGUF Q4_K_M olarak nicemlendi, Ollama ile yerelde çalışıyor |
+
+Eğitimde kullanılmayan 40 vaka üzerinde değerlendirme ([`outputs/model_degerlendirme`](outputs/model_degerlendirme)):
+
+| Ölçüt | Sonuç |
+| --- | --- |
+| Uydurma sayı içermeyen yanıtlar | **%97,5** (39/40) |
+| Üretilen tüm sayılar içinde uydurma sayı oranı | **%0,3** (1/390) |
+| Toplam risk puanını belirten yanıtlar | %87,5 (35/40) |
+| Güncelliğini yitirmiş güvenlik tavsiyesi | 0/40 |
+| Ezber kontrolü: eğitim verisinden kopyalanmış 30+ kelimelik dizi | **yok** |
+
+Ezber kontrolü, üretilen her metni 2.014 eğitim metniyle 8 kelimelik dizi örtüşmesi üzerinden (ortalama %15,4; alana özgü kalıp ifadelerle uyumlu) ve aynı girdi için öğretmen modelin referans yanıtıyla (ortalama benzerlik %19,4) karşılaştırıyor.
+
+### Risk iletişiminde üslup
+
+Aynı sonuç farklı biçimlerde anlatılabilir. [`src/risk_communication.py`](src/risk_communication.py), iletişim üsluplarını tanımlar (örneğin riski küçümsemeden sakinleştiren bir üslup) ve kullanıcının bağlamına göre birini seçer. [`src/deney.py`](src/deney.py) ve **Deney** sekmesi, üç kollu, katılımcılar arası (between-subjects) bir kullanıcı çalışması yürütür: LLM içermeyen deterministik teknik rapor, ham LLM çıktısı ve üslubu yönetilen çıktı.
+
+### Özellikler
+
+- Çalışma alanındaki herhangi bir nokta için deprem, heyelan ve sel/su baskını riski
+- Malzeme, yapım yılı, kat sayısı, oturulan kat ve asansörden bina kırılganlığı
+- Haritada saydamlığı ayarlanabilen risk katmanı
+- "Bu puan neden çıktı?" faktör dökümü
+- Senaryo karşılaştırma (örneğin güçlendirme sonrası puan)
+- En yakın toplanma alanı ve mesafe/süreli yürüme rotası (OSRM)
+- Analiz geçmişi, PDF rapor, açık ve koyu tema
+- Tek ortam değişkeniyle Gemini 2.5 Flash veya yerel model arasında geçiş yapılan asistan
+
+### Teknolojiler
+
+**Backend:** Python, FastAPI, GeoPandas, Rasterio, Shapely, PyProj, NumPy, pandas, LangChain
+**Frontend:** React, Vite, Leaflet / React Leaflet
+**ML:** Hugging Face Transformers, PEFT (QLoRA), bitsandbytes, llama.cpp (GGUF), Ollama
+**Veri:** OpenStreetMap, OSRM, Copernicus DEM (eğim), fay, litoloji, akarsu ve arazi kullanımı CBS katmanları
+
+### Yerelde çalıştırma
+
+Gereksinimler: Python 3.10+, Node.js 18+.
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cd frontend && npm install && cd ..
+```
+
+Backend (1. terminal):
+
+```bash
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8514
+```
+
+Frontend (2. terminal):
+
+```bash
+cd frontend && npm run dev
+```
+
+Tarayıcıda `http://127.0.0.1:5173` adresini açın.
+
+**Asistan sağlayıcısı.** Varsayılan olarak asistan Gemini kullanır: proje kökündeki `.env` dosyasına `GOOGLE_API_KEY=...` yazın. İnce ayarlı modelle çevrimdışı çalıştırmak için modeli Ollama ile oluşturun (`FROM` satırını GGUF dosyanıza yönlendirdikten sonra `ollama create disasterai -f tools/Modelfile.disasterai`) ve backend'i `MODEL_SAGLAYICI=yerel` ile başlatın. Risk analizi, harita ve rota hiçbir LLM olmadan da çalışır.
+
+**Eğim rasterı.** `data/raster/egim.tif` repoda bulunuyor. Yeniden üretmek için Copernicus DEM N38 E026 ve N38 E027 paftalarını `data/raster/` klasörüne indirip `tools/egim_uret.py` dosyasını çalıştırın.
+
+### Yazar
+
+**Ayşe Çetin** · Yönetim Bilişim Sistemleri, Pamukkale Üniversitesi
+[Portfolyo](https://aysecetin.github.io) · [LinkedIn](https://www.linkedin.com/in/ayseecetin/)
